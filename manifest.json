@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.dlpwaters.ebook-reader",
   "name": "Leaf Reader",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "author": "David Waters",
   "license": "MIT",
   "description": "A calm, local-first ebook library and native Omarchy reading window with automatic resume.",

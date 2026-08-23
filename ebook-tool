@@ -39,6 +39,8 @@ READER_FILE = STATE_DIR / "reader.json"
 PORT = 4189
 
 INDEX_VERSION = 2
+MAX_EPUB_CONTAINER_XML_BYTES = 64 * 1024
+MAX_EPUB_PACKAGE_XML_BYTES = 2 * 1024 * 1024
 MAX_COVER_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_COVER_DIMENSION = 4096
 MAX_COVER_PIXELS = 12_000_000
@@ -161,6 +163,8 @@ def text_of(node: ET.Element | None, default: str = "") -> str:
 
 
 def parse_opf_bytes(data: bytes) -> dict:
+    if len(data) > MAX_EPUB_PACKAGE_XML_BYTES:
+        return {}
     try:
         root = ET.fromstring(data)
     except ET.ParseError:
@@ -172,23 +176,59 @@ def parse_opf_bytes(data: bytes) -> dict:
     return {"title": title, "authors": creators, "language": language, "description": description}
 
 
+def safe_epub_member_name(value: object) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        return ""
+    if value.startswith("/") or any(part in {"", ".", ".."} for part in value.split("/")):
+        return ""
+    return value
+
+
+def bounded_zip_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes | None:
+    """Read one non-encrypted ZIP member without trusting its compressed payload."""
+    safe_name = safe_epub_member_name(name)
+    if not safe_name:
+        return None
+    try:
+        info = archive.getinfo(safe_name)
+    except KeyError:
+        return None
+    if info.is_dir() or info.flag_bits & 0x1 or info.file_size > limit:
+        return None
+    with archive.open(info, "r") as member:
+        data = member.read(limit + 1)
+    if len(data) > limit or len(data) != info.file_size:
+        return None
+    return data
+
+
 def epub_metadata(path: Path) -> dict:
     try:
         with zipfile.ZipFile(path) as archive:
-            container = ET.fromstring(archive.read("META-INF/container.xml"))
+            container_data = bounded_zip_member(
+                archive, "META-INF/container.xml", MAX_EPUB_CONTAINER_XML_BYTES,
+            )
+            if container_data is None:
+                return {}
+            container = ET.fromstring(container_data)
             node = container.find(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
             if node is None:
                 return {}
-            opf_path = node.attrib.get("full-path", "")
-            return parse_opf_bytes(archive.read(opf_path))
-    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError):
+            opf_path = safe_epub_member_name(node.attrib.get("full-path", ""))
+            opf_data = bounded_zip_member(archive, opf_path, MAX_EPUB_PACKAGE_XML_BYTES)
+            return parse_opf_bytes(opf_data) if opf_data is not None else {}
+    except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, ET.ParseError):
         return {}
 
 
 def sidecar_metadata(directory: Path) -> dict:
     opf = directory / "metadata.opf"
     try:
-        return parse_opf_bytes(opf.read_bytes()) if opf.is_file() else {}
+        if not opf.is_file() or opf.stat().st_size > MAX_EPUB_PACKAGE_XML_BYTES:
+            return {}
+        with opf.open("rb") as handle:
+            data = handle.read(MAX_EPUB_PACKAGE_XML_BYTES + 1)
+        return parse_opf_bytes(data) if len(data) <= MAX_EPUB_PACKAGE_XML_BYTES else {}
     except OSError:
         return {}
 
@@ -326,10 +366,18 @@ def sanitize_cover_bytes(data: bytes, book_id: str, source_mtime_ns: int = 0) ->
 def safe_cover_from_epub(path: Path, book_id: str) -> str:
     try:
         with zipfile.ZipFile(path) as archive:
-            container = ET.fromstring(archive.read("META-INF/container.xml"))
+            container_data = bounded_zip_member(
+                archive, "META-INF/container.xml", MAX_EPUB_CONTAINER_XML_BYTES,
+            )
+            if container_data is None:
+                return ""
+            container = ET.fromstring(container_data)
             node = container.find(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
-            opf_name = node.attrib.get("full-path", "") if node is not None else ""
-            root = ET.fromstring(archive.read(opf_name))
+            opf_name = safe_epub_member_name(node.attrib.get("full-path", "")) if node is not None else ""
+            opf_data = bounded_zip_member(archive, opf_name, MAX_EPUB_PACKAGE_XML_BYTES)
+            if opf_data is None:
+                return ""
+            root = ET.fromstring(opf_data)
             cover_id = ""
             for meta in root.findall(".//{*}meta"):
                 if meta.attrib.get("name", "").lower() == "cover":
@@ -349,12 +397,11 @@ def safe_cover_from_epub(path: Path, book_id: str) -> str:
             member = str((Path(opf_name).parent / item.attrib.get("href", "")).as_posix())
             if member.startswith("../") or member.startswith("/"):
                 return ""
-            cover_info = archive.getinfo(member)
-            if cover_info.is_dir() or cover_info.flag_bits & 0x1 or cover_info.file_size > MAX_COVER_SOURCE_BYTES:
+            data = bounded_zip_member(archive, member, MAX_COVER_SOURCE_BYTES)
+            if data is None:
                 return ""
-            data = archive.read(cover_info)
             return sanitize_cover_bytes(data, book_id, path.stat().st_mtime_ns)
-    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError):
+    except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, ET.ParseError):
         return ""
 
 

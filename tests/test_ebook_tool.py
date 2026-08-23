@@ -20,7 +20,10 @@ VALID_PNG = base64.b64decode(
 )
 
 
-def make_epub(path: Path, title="A Quiet Book", author="A. Reader", cover_data=VALID_PNG):
+def make_epub(
+    path: Path, title="A Quiet Book", author="A. Reader", cover_data=VALID_PNG,
+    *, container_data=None, opf_data=None,
+):
     container = """<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles><rootfile full-path="OPS/book.opf" media-type="application/oebps-package+xml"/></rootfiles>
@@ -36,8 +39,8 @@ def make_epub(path: Path, title="A Quiet Book", author="A. Reader", cover_data=V
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip")
-        archive.writestr("META-INF/container.xml", container)
-        archive.writestr("OPS/book.opf", opf)
+        archive.writestr("META-INF/container.xml", container if container_data is None else container_data)
+        archive.writestr("OPS/book.opf", opf if opf_data is None else opf_data)
         archive.writestr("OPS/cover.png", cover_data)
 
 
@@ -92,6 +95,51 @@ class LeafReaderTests(unittest.TestCase):
         with mock.patch.object(leaf, "sanitize_cover_bytes") as sanitizer:
             self.assertEqual(leaf.safe_cover_from_epub(path, "oversized"), "")
         sanitizer.assert_not_called()
+
+    def test_oversized_epub_container_is_rejected_before_xml_parsing(self):
+        path = self.library / "Oversized Container.epub"
+        make_epub(
+            path,
+            container_data=b"x" * (leaf.MAX_EPUB_CONTAINER_XML_BYTES + 1),
+        )
+        with mock.patch.object(leaf.ET, "fromstring") as parse_xml:
+            self.assertEqual(leaf.epub_metadata(path), {})
+            self.assertEqual(leaf.safe_cover_from_epub(path, "oversized-container"), "")
+        parse_xml.assert_not_called()
+
+    def test_oversized_epub_package_is_rejected_before_opf_parsing(self):
+        path = self.library / "Oversized Package.epub"
+        make_epub(
+            path,
+            opf_data=b"x" * (leaf.MAX_EPUB_PACKAGE_XML_BYTES + 1),
+        )
+        with mock.patch.object(leaf, "parse_opf_bytes") as parse_opf, \
+             mock.patch.object(leaf, "sanitize_cover_bytes") as sanitizer:
+            self.assertEqual(leaf.epub_metadata(path), {})
+            self.assertEqual(leaf.safe_cover_from_epub(path, "oversized-package"), "")
+        parse_opf.assert_not_called()
+        sanitizer.assert_not_called()
+
+    def test_sidecar_package_metadata_is_bounded_before_read(self):
+        (self.library / "metadata.opf").write_bytes(
+            b"x" * (leaf.MAX_EPUB_PACKAGE_XML_BYTES + 1)
+        )
+        with mock.patch.object(leaf, "parse_opf_bytes") as parse_opf:
+            self.assertEqual(leaf.sidecar_metadata(self.library), {})
+        parse_opf.assert_not_called()
+
+    def test_zip_member_read_has_an_independent_actual_byte_ceiling(self):
+        info = mock.Mock()
+        info.is_dir.return_value = False
+        info.flag_bits = 0
+        info.file_size = 1
+        archive = mock.Mock()
+        archive.getinfo.return_value = info
+        member = mock.MagicMock()
+        member.__enter__.return_value.read.return_value = b"x" * 10
+        archive.open.return_value = member
+        self.assertIsNone(leaf.bounded_zip_member(archive, "OPS/book.opf", 8))
+        member.__enter__.return_value.read.assert_called_once_with(9)
 
     def test_cover_is_reencoded_by_resource_limited_process(self):
         def fake_run(command, **_kwargs):

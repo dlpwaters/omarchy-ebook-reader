@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4 — 2026-08-23
+
+- Reject oversized EPUB container and package XML from ZIP descriptors before decompression or parsing
+- Cap actual ZIP-member reads even when archive metadata is malformed, and reject encrypted or unsafe metadata paths
+- Apply the same package-metadata ceiling to sidecar `metadata.opf` files
+
 ## 1.1.3 — 2026-08-22
 
 - Reject covers larger than 8 MiB, 4096 pixels on either side, or 12 megapixels before decoding
