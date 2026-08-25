@@ -11,16 +11,21 @@ import mimetypes
 import os
 import re
 import secrets
+import signal
 import shutil
+import socket
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import zipfile
 from datetime import datetime, timezone
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -47,6 +52,32 @@ MAX_COVER_PIXELS = 12_000_000
 MAX_COVER_CACHE_BYTES = 3 * 1024 * 1024
 COVER_WIDTH = 512
 COVER_HEIGHT = 768
+MAX_SETTINGS_BYTES = 64 * 1024
+MAX_RUNTIME_STATE_BYTES = 16 * 1024
+MAX_PROGRESS_BYTES = 8 * 1024 * 1024
+MAX_INDEX_BYTES = 32 * 1024 * 1024
+MAX_LIBRARY_FILES = 5000
+MAX_LIBRARY_BOOKS = 2000
+MAX_SHELL_BOOKS = 1000
+MAX_SCAN_SECONDS = 8.0
+MAX_PATH_CHARS = 4096
+MAX_TITLE_CHARS = 512
+MAX_AUTHOR_CHARS = 256
+MAX_AUTHORS = 16
+MAX_LANGUAGE_CHARS = 64
+MAX_DESCRIPTION_CHARS = 4096
+MAX_CHAPTER_CHARS = 1024
+MAX_CFI_CHARS = 8192
+MAX_BOOKMARKS = 200
+MAX_BOOK_BYTES = 512 * 1024 * 1024
+MAX_EPUB_BYTES = 256 * 1024 * 1024
+MAX_EPUB_MEMBERS = 10_000
+MAX_EPUB_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_EPUB_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_EPUB_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
+MAX_POST_BYTES = 256 * 1024
+MAX_HTTP_WORKERS = 8
+MAX_SHELL_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 SUPPORTED = {"epub", "azw", "azw3", "mobi", "prc", "pdf", "fb2", "fbz", "htmlz", "txt", "txtz", "rtf"}
 CONVERTIBLE = SUPPORTED - {"epub", "pdf"}
@@ -54,31 +85,93 @@ FORMAT_PRIORITY = ["epub", "azw3", "mobi", "azw", "prc", "fb2", "fbz", "htmlz", 
 THEMES = {"paper", "sepia", "night", "slate"}
 FONTS = {"serif", "sans", "publisher"}
 FLOWS = {"paginated", "scrolled"}
+CONVERSION_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def json_byte_limit(path: Path) -> int:
+    if path == SETTINGS_FILE:
+        return MAX_SETTINGS_BYTES
+    if path in {SERVER_FILE, READER_FILE}:
+        return MAX_RUNTIME_STATE_BYTES
+    if path == PROGRESS_FILE:
+        return MAX_PROGRESS_BYTES
+    if path == INDEX_FILE:
+        return MAX_INDEX_BYTES
+    return MAX_PROGRESS_BYTES
+
+
+def private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
 def atomic_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temp, path)
+    data = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(data) > json_byte_limit(path):
+        raise ValueError(f"Refusing to write oversized state file: {path.name}")
+    private_directory(path.parent)
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(6)}")
+    try:
+        with temp.open("xb") as handle:
+            os.chmod(handle.fileno(), 0o600)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        path.chmod(0o600)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def read_json(path: Path, fallback: object) -> object:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > json_byte_limit(path):
+            return fallback
+        with path.open("rb") as handle:
+            data = handle.read(json_byte_limit(path) + 1)
+        if len(data) > json_byte_limit(path):
+            return fallback
+        value = json.loads(data)
         return value
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, UnicodeDecodeError, RecursionError):
         return fallback
 
 
-def contains_supported_book(folder: Path) -> bool:
+def bounded_text(value: object, limit: int, fallback: str = "") -> str:
+    if not isinstance(value, (str, int, float)):
+        return fallback
+    return str(value).replace("\x00", "")[:limit]
+
+
+def bounded_float(value: object, fallback: float) -> float:
+    try:
+        result = float(value)
+        return result if result == result and abs(result) != float("inf") else fallback
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def bounded_int(value: object, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def contains_supported_book(folder: Path, deadline: float | None = None) -> bool:
     if not folder.is_dir():
         return False
     for _, directories, files in os.walk(folder):
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
         directories[:] = [name for name in directories if not name.startswith(".")]
         if any(Path(name).suffix.lower().lstrip(".") in SUPPORTED for name in files):
             return True
@@ -87,9 +180,10 @@ def contains_supported_book(folder: Path) -> bool:
 
 def default_library() -> str:
     personal_books = Path.home() / "Books"
-    if contains_supported_book(personal_books):
+    deadline = time.monotonic() + 1.0
+    if contains_supported_book(personal_books, deadline):
         return str(personal_books)
-    if contains_supported_book(STARTER_LIBRARY_DIR):
+    if contains_supported_book(STARTER_LIBRARY_DIR, deadline):
         return str(STARTER_LIBRARY_DIR)
     return str(personal_books)
 
@@ -134,11 +228,16 @@ def boolean_setting(value, fallback: bool) -> bool:
 def validate_settings(value: dict) -> dict:
     result = default_settings()
     result.update(value)
-    folder = Path(os.path.expandvars(os.path.expanduser(str(result.get("libraryFolder", ""))))).resolve()
+    raw_folder = bounded_text(result.get("libraryFolder", ""), MAX_PATH_CHARS, result["libraryFolder"])
+    expanded = bounded_text(os.path.expandvars(os.path.expanduser(raw_folder)), MAX_PATH_CHARS, result["libraryFolder"])
+    try:
+        folder = Path(expanded).resolve()
+    except (OSError, RuntimeError):
+        folder = Path(result["libraryFolder"]).resolve()
     result["libraryFolder"] = str(folder)
-    result["fontSize"] = max(14, min(36, int(result.get("fontSize", 20))))
-    result["lineHeight"] = max(1.25, min(2.2, round(float(result.get("lineHeight", 1.65)), 2)))
-    result["pageWidth"] = max(520, min(1100, int(result.get("pageWidth", 760))))
+    result["fontSize"] = max(14, min(36, bounded_int(result.get("fontSize"), 20)))
+    result["lineHeight"] = max(1.25, min(2.2, round(bounded_float(result.get("lineHeight"), 1.65), 2)))
+    result["pageWidth"] = max(520, min(1100, bounded_int(result.get("pageWidth"), 760)))
     result["theme"] = result.get("theme") if result.get("theme") in THEMES else "paper"
     result["fontFamily"] = result.get("fontFamily") if result.get("fontFamily") in FONTS else "serif"
     result["flow"] = result.get("flow") if result.get("flow") in FLOWS else "paginated"
@@ -169,10 +268,14 @@ def parse_opf_bytes(data: bytes) -> dict:
         root = ET.fromstring(data)
     except ET.ParseError:
         return {}
-    title = text_of(root.find(".//{http://purl.org/dc/elements/1.1/}title"))
-    creators = [text_of(x) for x in root.findall(".//{http://purl.org/dc/elements/1.1/}creator") if text_of(x)]
-    language = text_of(root.find(".//{http://purl.org/dc/elements/1.1/}language"))
-    description = text_of(root.find(".//{http://purl.org/dc/elements/1.1/}description"))
+    title = bounded_text(text_of(root.find(".//{http://purl.org/dc/elements/1.1/}title")), MAX_TITLE_CHARS)
+    creators = []
+    for node in root.findall(".//{http://purl.org/dc/elements/1.1/}creator")[:MAX_AUTHORS]:
+        creator = bounded_text(text_of(node), MAX_AUTHOR_CHARS)
+        if creator:
+            creators.append(creator)
+    language = bounded_text(text_of(root.find(".//{http://purl.org/dc/elements/1.1/}language")), MAX_LANGUAGE_CHARS)
+    description = bounded_text(text_of(root.find(".//{http://purl.org/dc/elements/1.1/}description")), MAX_DESCRIPTION_CHARS)
     return {"title": title, "authors": creators, "language": language, "description": description}
 
 
@@ -184,15 +287,78 @@ def safe_epub_member_name(value: object) -> str:
     return value
 
 
+def epub_directory_preflight(path: Path) -> bool:
+    """Reject oversized/ZIP64 central directories before ZipFile allocates for them."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        file_size = path.stat().st_size
+        if file_size < 22 or file_size > MAX_EPUB_BYTES:
+            return False
+        tail_size = min(file_size, 65_557)
+        with path.open("rb") as handle:
+            handle.seek(file_size - tail_size)
+            tail = handle.read(tail_size)
+        marker = tail.rfind(b"PK\x05\x06")
+        if marker < 0 or marker + 22 > len(tail):
+            return False
+        eocd = struct.unpack("<4s4H2LH", tail[marker:marker + 22])
+        _, disk, directory_disk, disk_entries, total_entries, directory_size, directory_offset, comment_size = eocd
+        eocd_offset = file_size - tail_size + marker
+        if disk != 0 or directory_disk != 0 or disk_entries != total_entries:
+            return False
+        # ZIP64 uses sentinel values here. Leaf Reader intentionally rejects it
+        # so the bounded classic directory can be checked before parsing.
+        if total_entries == 0xFFFF or directory_size == 0xFFFFFFFF or directory_offset == 0xFFFFFFFF:
+            return False
+        if total_entries < 1 or total_entries > MAX_EPUB_MEMBERS:
+            return False
+        if directory_size < 1 or directory_size > MAX_EPUB_CENTRAL_DIRECTORY_BYTES:
+            return False
+        if directory_offset + directory_size != eocd_offset:
+            return False
+        return eocd_offset + 22 + comment_size == file_size
+    except (OSError, ValueError, struct.error):
+        return False
+
+
+def epub_archive_is_safe(path: Path) -> bool:
+    """Validate archive structure and expansion ceilings before browser use."""
+    if not epub_directory_preflight(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_EPUB_MEMBERS:
+                return False
+            names: set[str] = set()
+            expanded = 0
+            for info in members:
+                if info.is_dir():
+                    continue
+                name = safe_epub_member_name(info.filename)
+                if not name or name in names or info.flag_bits & 0x1:
+                    return False
+                names.add(name)
+                if info.file_size < 0 or info.file_size > MAX_EPUB_MEMBER_BYTES:
+                    return False
+                expanded += info.file_size
+                if expanded > MAX_EPUB_UNCOMPRESSED_BYTES:
+                    return False
+            return "META-INF/container.xml" in names
+    except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
+        return False
+
+
 def bounded_zip_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes | None:
     """Read one non-encrypted ZIP member without trusting its compressed payload."""
     safe_name = safe_epub_member_name(name)
     if not safe_name:
         return None
-    try:
-        info = archive.getinfo(safe_name)
-    except KeyError:
+    matches = [info for info in archive.infolist() if info.filename == safe_name]
+    if len(matches) != 1:
         return None
+    info = matches[0]
     if info.is_dir() or info.flag_bits & 0x1 or info.file_size > limit:
         return None
     with archive.open(info, "r") as member:
@@ -204,7 +370,11 @@ def bounded_zip_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes
 
 def epub_metadata(path: Path) -> dict:
     try:
+        if not epub_directory_preflight(path):
+            return {}
         with zipfile.ZipFile(path) as archive:
+            if len(archive.infolist()) > MAX_EPUB_MEMBERS:
+                return {}
             container_data = bounded_zip_member(
                 archive, "META-INF/container.xml", MAX_EPUB_CONTAINER_XML_BYTES,
             )
@@ -224,7 +394,7 @@ def epub_metadata(path: Path) -> dict:
 def sidecar_metadata(directory: Path) -> dict:
     opf = directory / "metadata.opf"
     try:
-        if not opf.is_file() or opf.stat().st_size > MAX_EPUB_PACKAGE_XML_BYTES:
+        if opf.is_symlink() or not opf.is_file() or opf.stat().st_size > MAX_EPUB_PACKAGE_XML_BYTES:
             return {}
         with opf.open("rb") as handle:
             data = handle.read(MAX_EPUB_PACKAGE_XML_BYTES + 1)
@@ -237,7 +407,7 @@ def clean_stem(value: str) -> str:
     result = re.sub(r"\s+-\s+[^-]{2,80}$", "", value)
     result = re.sub(r"\s*\(\d+\)$", "", result)
     result = re.sub(r"[_\s]+", " ", result).strip(" ._-")
-    return result or "Untitled"
+    return bounded_text(result or "Untitled", MAX_TITLE_CHARS, "Untitled")
 
 
 def stable_id(value: str) -> str:
@@ -296,15 +466,21 @@ def cover_image_info(data: bytes) -> tuple[str, int, int] | None:
 
 def sanitized_cover_is_valid(path: Path) -> bool:
     try:
-        if not path.is_file() or path.stat().st_size > MAX_COVER_CACHE_BYTES:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_COVER_CACHE_BYTES:
             return False
-        info = cover_image_info(path.read_bytes())
+        with path.open("rb") as handle:
+            data = handle.read(MAX_COVER_CACHE_BYTES + 1)
+        if len(data) > MAX_COVER_CACHE_BYTES:
+            return False
+        info = cover_image_info(data)
         return bool(info and info[0] == "png" and info[1] <= COVER_WIDTH and info[2] <= COVER_HEIGHT)
     except OSError:
         return False
 
 
-def sanitize_cover_bytes(data: bytes, book_id: str, source_mtime_ns: int = 0) -> str:
+def sanitize_cover_bytes(
+    data: bytes, book_id: str, source_mtime_ns: int = 0, deadline: float | None = None,
+) -> str:
     """Decode untrusted cover bytes outside the shell and cache a bounded PNG."""
     if len(data) > MAX_COVER_SOURCE_BYTES:
         return ""
@@ -320,7 +496,10 @@ def sanitize_cover_bytes(data: bytes, book_id: str, source_mtime_ns: int = 0) ->
     magick = shutil.which("magick")
     if not magick:
         return ""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    remaining = 15.0 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        return ""
+    private_directory(target.parent)
     nonce = f"{os.getpid()}-{secrets.token_hex(6)}"
     source = target.parent / f".{book_id}-{nonce}.{info[0]}"
     pending = target.parent / f".{book_id}-{nonce}.png"
@@ -348,8 +527,8 @@ def sanitize_cover_bytes(data: bytes, book_id: str, source_mtime_ns: int = 0) ->
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=15,
+            stderr=subprocess.DEVNULL,
+            timeout=max(0.1, min(15.0, remaining)),
             check=False,
         )
         if result.returncode != 0 or not sanitized_cover_is_valid(pending):
@@ -363,9 +542,13 @@ def sanitize_cover_bytes(data: bytes, book_id: str, source_mtime_ns: int = 0) ->
         pending.unlink(missing_ok=True)
 
 
-def safe_cover_from_epub(path: Path, book_id: str) -> str:
+def safe_cover_from_epub(path: Path, book_id: str, deadline: float | None = None) -> str:
     try:
+        if not epub_directory_preflight(path):
+            return ""
         with zipfile.ZipFile(path) as archive:
+            if len(archive.infolist()) > MAX_EPUB_MEMBERS:
+                return ""
             container_data = bounded_zip_member(
                 archive, "META-INF/container.xml", MAX_EPUB_CONTAINER_XML_BYTES,
             )
@@ -400,106 +583,202 @@ def safe_cover_from_epub(path: Path, book_id: str) -> str:
             data = bounded_zip_member(archive, member, MAX_COVER_SOURCE_BYTES)
             if data is None:
                 return ""
-            return sanitize_cover_bytes(data, book_id, path.stat().st_mtime_ns)
+            return sanitize_cover_bytes(data, book_id, path.stat().st_mtime_ns, deadline)
     except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile, ET.ParseError):
         return ""
 
 
-def safe_cover_from_sidecar(path: Path, book_id: str) -> str:
+def safe_cover_from_sidecar(path: Path, book_id: str, deadline: float | None = None) -> str:
     try:
         stat = path.stat()
         if not path.is_file() or stat.st_size > MAX_COVER_SOURCE_BYTES:
             return ""
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(MAX_COVER_SOURCE_BYTES + 1)
+        if len(data) > MAX_COVER_SOURCE_BYTES:
+            return ""
     except OSError:
         return ""
-    return sanitize_cover_bytes(data, book_id, stat.st_mtime_ns)
+    return sanitize_cover_bytes(data, book_id, stat.st_mtime_ns, deadline)
 
 
-def scan_library(force: bool = False) -> list[dict]:
+def cached_cover_path(value: object, book_id: str) -> str:
+    expected = (CACHE_DIR / "covers" / f"{book_id}.png").resolve()
+    candidate = Path(bounded_text(value, MAX_PATH_CHARS))
+    try:
+        if candidate.resolve() != expected or not sanitized_cover_is_valid(expected):
+            return ""
+        return str(expected)
+    except OSError:
+        return ""
+
+
+def normalized_progress_entry(value: object) -> dict:
+    source = value if isinstance(value, dict) else {}
+    bookmarks = []
+    raw_bookmarks = source.get("bookmarks", [])
+    if isinstance(raw_bookmarks, list):
+        for raw in raw_bookmarks[:MAX_BOOKMARKS]:
+            if not isinstance(raw, dict):
+                continue
+            cfi = bounded_text(raw.get("cfi"), MAX_CFI_CHARS)
+            if not cfi:
+                continue
+            bookmarks.append({
+                "cfi": cfi,
+                "label": bounded_text(raw.get("label"), MAX_CHAPTER_CHARS),
+                "created": bounded_text(raw.get("created"), 64),
+            })
+    return {
+        "cfi": bounded_text(source.get("cfi"), MAX_CFI_CHARS),
+        "percentage": max(0.0, min(1.0, bounded_float(source.get("percentage"), 0.0))),
+        "chapter": bounded_text(source.get("chapter"), MAX_CHAPTER_CHARS),
+        "bookmarks": bookmarks,
+        "lastOpened": bounded_text(source.get("lastOpened"), 64),
+    }
+
+
+def scan_library(force: bool = False, deadline_seconds: float = MAX_SCAN_SECONDS) -> list[dict]:
     cfg = settings()
     root = Path(cfg["libraryFolder"])
     if not root.is_dir():
         return []
+    try:
+        root = root.resolve()
+    except OSError:
+        return []
+    deadline = time.monotonic() + max(0.1, min(MAX_SCAN_SECONDS, deadline_seconds))
     cache = read_json(INDEX_FILE, {})
     if not isinstance(cache, dict):
         cache = {}
     records = cache.get("records", {}) if (
         cache.get("version") == INDEX_VERSION and cache.get("root") == str(root)
     ) else {}
+    if not isinstance(records, dict):
+        records = {}
     progress = read_json(PROGRESS_FILE, {})
     if not isinstance(progress, dict):
         progress = {}
     groups: dict[str, list[Path]] = {}
     count = 0
     for base, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"node_modules", "__pycache__"}]
+        if time.monotonic() >= deadline:
+            break
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".") and d not in {"node_modules", "__pycache__"}
+            and not (Path(base) / d).is_symlink()
+        ]
         for name in files:
+            if time.monotonic() >= deadline:
+                break
             suffix = Path(name).suffix.lower().lstrip(".")
             if suffix not in SUPPORTED:
                 continue
             path = Path(base) / name
             try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                path = path.resolve()
+                path.relative_to(root)
+                info = path.stat()
+                size_limit = MAX_EPUB_BYTES if suffix == "epub" else MAX_BOOK_BYTES
+                if info.st_size < 1 or info.st_size > size_limit or len(str(path)) > MAX_PATH_CHARS:
+                    continue
                 relative_parent = path.parent.relative_to(root)
-            except ValueError:
+            except (OSError, ValueError):
                 continue
             group_key = str(relative_parent) if relative_parent != Path(".") else clean_stem(path.stem).casefold()
+            if group_key not in groups and len(groups) >= MAX_LIBRARY_BOOKS:
+                break
             groups.setdefault(group_key, []).append(path)
             count += 1
-            if count >= 15000:
+            if count >= MAX_LIBRARY_FILES:
                 break
-        if count >= 15000:
+        if count >= MAX_LIBRARY_FILES or len(groups) >= MAX_LIBRARY_BOOKS:
             break
     books: list[dict] = []
     next_records: dict[str, dict] = {}
     for group_key, paths in groups.items():
+        if time.monotonic() >= deadline:
+            break
         paths.sort(key=lambda p: (FORMAT_PRIORITY.index(p.suffix.lower().lstrip(".")), str(p))
                    if p.suffix.lower().lstrip(".") in FORMAT_PRIORITY else (999, str(p)))
         primary = paths[0]
         book_id = stable_id(str(root) + "\0" + group_key)
         signature_paths = list(paths)
-        signature_paths.extend(p for p in (primary.parent / "metadata.opf", primary.parent / "cover.jpg") if p.is_file())
-        signature = "|".join(f"{p}:{p.stat().st_mtime_ns}:{p.stat().st_size}" for p in signature_paths)
+        signature_paths.extend(
+            p for p in (primary.parent / "metadata.opf", primary.parent / "cover.jpg")
+            if p.is_file() and not p.is_symlink()
+        )
+        try:
+            signature = "|".join(
+                f"{p}:{p.stat().st_mtime_ns}:{p.stat().st_size}" for p in signature_paths
+            )
+        except OSError:
+            continue
         cached = records.get(book_id, {}) if not force else {}
-        if cached.get("signature") == signature:
-            book = dict(cached.get("book", {}))
+        if not isinstance(cached, dict):
+            cached = {}
+        cached_book = cached.get("book", {}) if isinstance(cached, dict) else {}
+        if cached.get("signature") == signature and isinstance(cached_book, dict):
+            title = bounded_text(cached_book.get("title"), MAX_TITLE_CHARS, clean_stem(primary.stem))
+            raw_authors = cached_book.get("authors", [])
+            authors = [bounded_text(author, MAX_AUTHOR_CHARS) for author in raw_authors[:MAX_AUTHORS]] \
+                if isinstance(raw_authors, list) else []
+            authors = [author for author in authors if author]
+            cover = cached_cover_path(cached_book.get("cover"), book_id)
+            language = bounded_text(cached_book.get("language"), MAX_LANGUAGE_CHARS)
+            description = bounded_text(cached_book.get("description"), MAX_DESCRIPTION_CHARS)
         else:
             metadata = sidecar_metadata(primary.parent)
             if not metadata and primary.suffix.lower() == ".epub":
                 metadata = epub_metadata(primary)
-            title = metadata.get("title") or clean_stem(primary.stem)
+            title = bounded_text(metadata.get("title"), MAX_TITLE_CHARS) or clean_stem(primary.stem)
             authors = metadata.get("authors") or []
             if isinstance(authors, str):
                 authors = [authors]
+            authors = [bounded_text(author, MAX_AUTHOR_CHARS) for author in authors[:MAX_AUTHORS]]
+            authors = [author for author in authors if author]
             cover_path = primary.parent / "cover.jpg"
-            cover = safe_cover_from_sidecar(cover_path, book_id) if cover_path.is_file() else ""
+            cover = safe_cover_from_sidecar(cover_path, book_id, deadline) if cover_path.is_file() and not cover_path.is_symlink() else ""
             if not cover:
                 epub_path = next((p for p in paths if p.suffix.lower() == ".epub"), None)
                 if epub_path:
-                    cover = safe_cover_from_epub(epub_path, book_id)
-            book = {
-                "id": book_id,
-                "title": title,
-                "authors": authors,
-                "author": " & ".join(authors) if authors else "Unknown author",
-                "path": str(primary),
-                "format": primary.suffix.lower().lstrip("."),
-                "formats": [p.suffix.lower().lstrip(".") for p in paths],
-                "files": {p.suffix.lower().lstrip("."): str(p) for p in paths},
-                "cover": cover,
-                "language": metadata.get("language", ""),
-                "description": metadata.get("description", ""),
-                "added": datetime.fromtimestamp(primary.stat().st_mtime, timezone.utc).isoformat(),
-            }
-        state = progress.get("books", {}).get(book_id, {}) if isinstance(progress.get("books", {}), dict) else {}
-        book["progress"] = max(0.0, min(1.0, float(state.get("percentage", 0) or 0)))
-        book["lastOpened"] = str(state.get("lastOpened", ""))
-        book["chapter"] = str(state.get("chapter", ""))
+                    cover = safe_cover_from_epub(epub_path, book_id, deadline)
+            language = bounded_text(metadata.get("language"), MAX_LANGUAGE_CHARS)
+            description = bounded_text(metadata.get("description"), MAX_DESCRIPTION_CHARS)
+        try:
+            added = datetime.fromtimestamp(primary.stat().st_mtime, timezone.utc).isoformat()
+        except (OSError, ValueError, OverflowError):
+            added = ""
+        book = {
+            "id": book_id,
+            "title": title,
+            "authors": authors,
+            "author": bounded_text(" & ".join(authors), MAX_AUTHOR_CHARS * 2, "Unknown author") if authors else "Unknown author",
+            "path": str(primary),
+            "format": primary.suffix.lower().lstrip("."),
+            "formats": [p.suffix.lower().lstrip(".") for p in paths],
+            "files": {p.suffix.lower().lstrip("."): str(p) for p in paths},
+            "cover": cover,
+            "language": language,
+            "description": description,
+            "added": added,
+        }
+        progress_books = progress.get("books", {}) if isinstance(progress, dict) else {}
+        state = normalized_progress_entry(progress_books.get(book_id, {})) if isinstance(progress_books, dict) else normalized_progress_entry({})
+        book["progress"] = state["percentage"]
+        book["lastOpened"] = state["lastOpened"]
+        book["chapter"] = state["chapter"]
         books.append(book)
         next_records[book_id] = {"signature": signature, "book": {k: v for k, v in book.items() if k not in {"progress", "lastOpened", "chapter"}}}
-    atomic_json(INDEX_FILE, {
-        "version": INDEX_VERSION, "root": str(root), "generated": utc_now(), "records": next_records,
-    })
+    try:
+        atomic_json(INDEX_FILE, {
+            "version": INDEX_VERSION, "root": str(root), "generated": utc_now(), "records": next_records,
+        })
+    except ValueError:
+        pass
     sorter = cfg["sort"]
     if sorter == "title":
         books.sort(key=lambda b: (b["title"].casefold(), b["author"].casefold()))
@@ -517,9 +796,17 @@ def progress_state() -> dict:
     value = read_json(PROGRESS_FILE, {"lastBookId": "", "books": {}})
     if not isinstance(value, dict):
         return {"lastBookId": "", "books": {}}
-    value.setdefault("lastBookId", "")
-    value.setdefault("books", {})
-    return value
+    raw_books = value.get("books", {})
+    books = {}
+    if isinstance(raw_books, dict):
+        for book_id, entry in list(raw_books.items())[:MAX_LIBRARY_BOOKS]:
+            safe_id = bounded_text(book_id, 20)
+            if re.fullmatch(r"[0-9a-f]{20}", safe_id):
+                books[safe_id] = normalized_progress_entry(entry)
+    last_book_id = bounded_text(value.get("lastBookId"), 20)
+    if last_book_id not in books:
+        last_book_id = ""
+    return {"lastBookId": last_book_id, "books": books}
 
 
 def update_progress(book_id: str, change: dict) -> dict:
@@ -529,32 +816,83 @@ def update_progress(book_id: str, change: dict) -> dict:
     allowed = {"cfi", "percentage", "chapter", "bookmarks", "lastOpened"}
     current.update({k: v for k, v in change.items() if k in allowed})
     current["lastOpened"] = utc_now()
-    current["percentage"] = max(0.0, min(1.0, float(current.get("percentage", 0) or 0)))
-    if not isinstance(current.get("bookmarks", []), list):
-        current["bookmarks"] = []
+    current = normalized_progress_entry(current)
     books[book_id] = current
     state["lastBookId"] = book_id
     atomic_json(PROGRESS_FILE, state)
     return current
 
 
-def library_payload(force: bool = False, query: str = "", limit: int = 0) -> dict:
-    books = scan_library(force=force)
+def projected_book(book: dict, surface: str) -> dict:
+    result = {
+        "id": book["id"],
+        "title": book["title"],
+        "author": book["author"],
+        "format": book["format"],
+        "formats": book["formats"],
+        "progress": book["progress"],
+        "lastOpened": book["lastOpened"],
+        "chapter": book["chapter"],
+    }
+    result["cover"] = book["cover"] if surface == "shell" else bool(book["cover"])
+    return result
+
+
+def reader_settings() -> dict:
+    current = settings()
+    allowed = {"fontSize", "fontFamily", "lineHeight", "pageWidth", "theme", "flow", "pageTurn", "showClock"}
+    return {key: current[key] for key in allowed}
+
+
+def library_payload(
+    force: bool = False, query: str = "", limit: int = 0,
+    deadline_seconds: float = MAX_SCAN_SECONDS, surface: str = "shell",
+    scanned_books: list[dict] | None = None,
+) -> dict:
+    books = list(scanned_books) if scanned_books is not None else scan_library(
+        force=force, deadline_seconds=deadline_seconds,
+    )
     if query:
-        needle = query.casefold()
+        needle = bounded_text(query, 256).casefold()
         books = [b for b in books if needle in f"{b['title']} {b['author']} {' '.join(b['formats'])}".casefold()]
-    if limit > 0:
-        books = books[:limit]
+    ceiling = MAX_SHELL_BOOKS if surface == "shell" else MAX_LIBRARY_BOOKS
+    requested_limit = max(0, min(ceiling, bounded_int(limit, 0)))
+    output_limit = requested_limit or ceiling
+    truncated = len(books) > output_limit
+    books = [projected_book(book, surface) for book in books[:output_limit]]
     state = progress_state()
-    return {
+    payload = {
         "ok": True,
         "books": books,
         "count": len(books),
+        "truncated": truncated,
         "lastBookId": state.get("lastBookId", ""),
-        "settings": settings(),
-        "starterLibrary": str(STARTER_LIBRARY_DIR),
-        "converterAvailable": shutil.which("ebook-convert") is not None,
+        "settings": settings() if surface == "shell" else reader_settings(),
     }
+    if surface == "shell":
+        payload["starterLibrary"] = str(STARTER_LIBRARY_DIR)
+        payload["converterAvailable"] = shutil.which("ebook-convert") is not None
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_SHELL_PAYLOAD_BYTES:
+            all_books = payload["books"]
+            low, high = 0, len(all_books)
+            while low < high:
+                middle = (low + high + 1) // 2
+                payload["books"] = all_books[:middle]
+                payload["count"] = middle
+                if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= MAX_SHELL_PAYLOAD_BYTES:
+                    low = middle
+                else:
+                    high = middle - 1
+            payload["books"] = all_books[:low]
+            payload["count"] = low
+            payload["truncated"] = True
+    else:
+        visible_ids = {book["id"] for book in books}
+        payload["progressState"] = {
+            "lastBookId": state.get("lastBookId", "") if state.get("lastBookId") in visible_ids else "",
+            "books": {book_id: entry for book_id, entry in state.get("books", {}).items() if book_id in visible_ids},
+        }
+    return payload
 
 
 def find_book(book_id: str) -> dict | None:
@@ -564,9 +902,19 @@ def find_book(book_id: str) -> dict | None:
 def readable_file(book: dict) -> Path:
     files = book.get("files", {})
     if files.get("epub"):
-        return Path(files["epub"])
-    if files.get("pdf"):
-        return Path(files["pdf"])
+        direct = Path(files["epub"])
+    elif files.get("pdf"):
+        direct = Path(files["pdf"])
+    else:
+        direct = None
+    if direct is not None:
+        info = direct.stat()
+        size_limit = MAX_EPUB_BYTES if direct.suffix.lower() == ".epub" else MAX_BOOK_BYTES
+        if direct.is_symlink() or not direct.is_file() or info.st_size < 1 or info.st_size > size_limit:
+            raise RuntimeError("Book is missing or exceeds the supported size limit")
+        if direct.suffix.lower() == ".epub" and not epub_archive_is_safe(direct):
+            raise RuntimeError("EPUB archive is invalid or exceeds safe expansion limits")
+        return direct
     source = Path(book["path"])
     fmt = source.suffix.lower().lstrip(".")
     if fmt not in CONVERTIBLE:
@@ -575,16 +923,42 @@ def readable_file(book: dict) -> Path:
     if not converter:
         raise RuntimeError(f"{fmt.upper()} requires the optional Calibre converter (ebook-convert)")
     target = CACHE_DIR / "converted" / f"{book['id']}.epub"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists() or target.stat().st_mtime < source.stat().st_mtime:
-        temporary = target.with_suffix(".working.epub")
-        result = subprocess.run([converter, str(source), str(temporary)], capture_output=True, text=True, timeout=300)
-        if result.returncode != 0 or not temporary.is_file():
-            temporary.unlink(missing_ok=True)
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            raise RuntimeError(detail[-1] if detail else f"Could not convert {fmt.upper()}")
-        os.replace(temporary, target)
-    return target
+    private_directory(target.parent)
+    with CONVERSION_LOCK:
+        source_info = source.stat()
+        if source.is_symlink() or not source.is_file() or source_info.st_size < 1 or source_info.st_size > MAX_BOOK_BYTES:
+            raise RuntimeError("Conversion source is missing or exceeds the supported size limit")
+        target_current = (
+            target.exists() and not target.is_symlink() and target.is_file()
+            and target.stat().st_mtime >= source_info.st_mtime and epub_archive_is_safe(target)
+        )
+        if not target_current:
+            temporary = target.with_name(
+                f".{book['id']}-{os.getpid()}-{secrets.token_hex(6)}.working.epub"
+            )
+            try:
+                with tempfile.TemporaryFile() as diagnostics:
+                    result = subprocess.run(
+                        [converter, str(source), str(temporary)],
+                        stdin=subprocess.DEVNULL, stdout=diagnostics, stderr=diagnostics,
+                        timeout=300, check=False,
+                    )
+                    diagnostics.seek(0, os.SEEK_END)
+                    diagnostic_size = diagnostics.tell()
+                    diagnostics.seek(max(0, diagnostic_size - 64 * 1024))
+                    detail = diagnostics.read().decode("utf-8", "replace").strip().splitlines()
+                if result.returncode != 0 or not epub_archive_is_safe(temporary):
+                    raise RuntimeError(
+                        bounded_text(detail[-1], 1024) if detail else
+                        f"Converted {fmt.upper()} book is invalid or exceeds safe expansion limits"
+                    )
+                os.replace(temporary, target)
+                target.chmod(0o600)
+            finally:
+                temporary.unlink(missing_ok=True)
+        if not epub_archive_is_safe(target):
+            raise RuntimeError("Readable book is invalid or exceeds safe expansion limits")
+        return target
 
 
 def server_info() -> dict:
@@ -607,78 +981,166 @@ def runtime_revision() -> str:
 
 def server_process_alive(info: dict | None = None) -> bool:
     info = info or server_info()
-    pid = int(info.get("pid", 0) or 0)
+    pid = bounded_int(info.get("pid"), 0)
     if pid <= 0:
         return False
     try:
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        return b"serve" in command and any(Path(os.fsdecode(part)).name == "ebook-tool" for part in command if part)
-    except OSError:
+        expected = os.fsencode(str(Path(__file__).resolve()))
+        return b"serve" in command and expected in command
+    except (OSError, TypeError, ValueError):
         return False
 
 
 def server_alive(info: dict | None = None) -> bool:
     info = info or server_info()
+    token = info.get("token", "")
     return (server_process_alive(info)
             and info.get("helper") == str(Path(__file__).resolve())
-            and info.get("revision") == runtime_revision())
+            and info.get("revision") == runtime_revision()
+            and isinstance(token, str) and 24 <= len(token) <= 128)
+
+
+def reader_process_alive(info: dict | None = None) -> bool:
+    info = info or read_json(READER_FILE, {})
+    if not isinstance(info, dict):
+        return False
+    pid = bounded_int(info.get("pid"), 0)
+    if pid <= 0:
+        return False
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        expected = os.fsencode(str((PLUGIN_DIR / "ReaderApp.qml").resolve()))
+        return expected in command
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 class ReaderHandler(BaseHTTPRequestHandler):
-    server_version = "LeafReader/1.1"
+    server_version = "LeafReader/1.1.5"
+    sys_version = ""
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(5.0)
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
-    def send_bytes(self, data: bytes, content_type: str, status: int = 200, cache: str = "no-store") -> None:
+    def send_bytes(
+        self, data: bytes, content_type: str, status: int = 200,
+        cache: str = "no-store", headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self' blob:; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src blob: 'self'")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self' blob:; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src blob: 'self'")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
 
-    def send_json(self, value: object, status: int = 200) -> None:
-        self.send_bytes(json.dumps(value, ensure_ascii=False).encode(), "application/json; charset=utf-8", status)
+    def send_json(self, value: object, status: int = 200, establish_session: bool = False) -> None:
+        headers = {}
+        if establish_session:
+            headers["Set-Cookie"] = (
+                f"leaf_session={self.server.token}; Path=/api/; HttpOnly; SameSite=Strict"
+            )
+        self.send_bytes(
+            json.dumps(value, ensure_ascii=False).encode(),
+            "application/json; charset=utf-8", status, headers=headers,
+        )
+
+    def send_file(self, path: Path, content_type: str, cache: str) -> None:
+        try:
+            info = path.stat()
+            if path.is_symlink() or not path.is_file() or info.st_size < 1 or info.st_size > MAX_BOOK_BYTES:
+                raise OSError("invalid file")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(info.st_size))
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.end_headers()
+            with path.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile, length=256 * 1024)
+        except (OSError, BrokenPipeError, ConnectionResetError, socket.timeout):
+            return
 
     def route(self) -> tuple[str, dict[str, list[str]]]:
         parsed = urllib.parse.urlsplit(self.path)
-        return parsed.path, urllib.parse.parse_qs(parsed.query)
+        return parsed.path, urllib.parse.parse_qs(parsed.query, max_num_fields=8)
+
+    def authenticated(self) -> bool:
+        presented = self.headers.get("X-Leaf-Token", "")
+        if not presented:
+            try:
+                cookies = SimpleCookie(self.headers.get("Cookie", ""))
+                presented = cookies.get("leaf_session").value if cookies.get("leaf_session") else ""
+            except (ValueError, TypeError):
+                presented = ""
+        return len(presented) == len(self.server.token) and secrets.compare_digest(presented, self.server.token)
+
+    def require_api_auth(self, route: str) -> bool:
+        if route.startswith("/api/") and not self.authenticated():
+            self.send_json({"ok": False, "error": "Reader session authorization required"}, 403)
+            return False
+        return True
 
     def do_GET(self) -> None:
-        route, query = self.route()
+        try:
+            route, query = self.route()
+        except ValueError:
+            self.send_json({"ok": False, "error": "Invalid query"}, 400)
+            return
+        if not self.require_api_auth(route):
+            return
         if route == "/api/bootstrap":
-            payload = library_payload(query=query.get("q", [""])[0])
-            payload["token"] = self.server.token
-            payload["progressState"] = progress_state()
-            self.send_json(payload)
+            self.server.rotate_launch_session()
+            payload = library_payload(
+                query=bounded_text(query.get("q", [""])[0], 256), surface="reader",
+                scanned_books=self.server.refresh_books(),
+            )
+            self.send_json(payload, establish_session=True)
             return
         if route.startswith("/api/book/"):
             book_id = route.rsplit("/", 1)[-1]
-            book = find_book(book_id)
+            if not re.fullmatch(r"[0-9a-f]{20}", book_id):
+                self.send_json({"ok": False, "error": "Book not found"}, 404)
+                return
+            book = self.server.find_book(book_id)
             if not book:
                 self.send_json({"ok": False, "error": "Book not found"}, 404)
                 return
             try:
                 path = readable_file(book)
-                data = path.read_bytes()
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 422)
+                self.send_json({"ok": False, "error": bounded_text(str(exc), 1024, "Book could not be opened")}, 422)
                 return
             mime = "application/pdf" if path.suffix.lower() == ".pdf" else "application/epub+zip"
-            self.send_bytes(data, mime, cache="private, max-age=3600")
+            self.send_file(path, mime, cache="private, max-age=3600")
             return
         if route.startswith("/api/cover/"):
-            book = find_book(route.rsplit("/", 1)[-1])
-            cover = Path(book["cover"]) if book and book.get("cover") else None
-            if not cover or not cover.is_file():
-                self.send_bytes(b"", "image/jpeg", 404)
+            book_id = route.rsplit("/", 1)[-1]
+            if not re.fullmatch(r"[0-9a-f]{20}", book_id):
+                self.send_bytes(b"", "image/png", 404)
                 return
-            mime = mimetypes.guess_type(cover.name)[0] or "image/jpeg"
-            self.send_bytes(cover.read_bytes(), mime, cache="private, max-age=86400")
+            book = self.server.find_book(book_id)
+            cover = Path(book["cover"]) if book and book.get("cover") else None
+            if not cover or not cached_cover_path(cover, book_id):
+                self.send_bytes(b"", "image/png", 404)
+                return
+            self.send_bytes(cover.read_bytes(), "image/png", cache="private, max-age=86400")
             return
         relative = "index.html" if route in {"/", "/reader"} else route.lstrip("/")
         target = (WEB_DIR / relative).resolve()
@@ -694,26 +1156,43 @@ class ReaderHandler(BaseHTTPRequestHandler):
         self.send_bytes(target.read_bytes(), mime, cache="no-cache")
 
     def do_POST(self) -> None:
-        if self.headers.get("X-Leaf-Token", "") != self.server.token:
-            self.send_json({"ok": False, "error": "Invalid request token"}, 403)
+        try:
+            route, _ = self.route()
+        except ValueError:
+            self.send_json({"ok": False, "error": "Invalid query"}, 400)
+            return
+        if not self.require_api_auth(route):
             return
         try:
-            length = min(int(self.headers.get("Content-Length", "0")), 1_000_000)
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > MAX_POST_BYTES:
+                self.send_json({"ok": False, "error": "Request body is missing or too large"}, 413)
+                return
             payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, TypeError):
+            if not isinstance(payload, dict):
+                raise TypeError("JSON object required")
+        except (ValueError, TypeError, RecursionError, socket.timeout):
             self.send_json({"ok": False, "error": "Invalid JSON"}, 400)
             return
-        route, _ = self.route()
         if route.startswith("/api/progress/"):
             book_id = route.rsplit("/", 1)[-1]
-            if not find_book(book_id):
+            if not re.fullmatch(r"[0-9a-f]{20}", book_id):
                 self.send_json({"ok": False, "error": "Book not found"}, 404)
                 return
-            self.send_json({"ok": True, "progress": update_progress(book_id, payload)})
+            if not self.server.find_book(book_id):
+                self.send_json({"ok": False, "error": "Book not found"}, 404)
+                return
+            try:
+                updated = update_progress(book_id, payload)
+            except ValueError:
+                self.send_json({"ok": False, "error": "Reading state has reached its safe size limit"}, 422)
+                return
+            self.send_json({"ok": True, "progress": updated})
             return
         if route == "/api/settings":
             allowed = {"fontSize", "fontFamily", "lineHeight", "pageWidth", "theme", "flow", "pageTurn", "showClock", "sort"}
-            self.send_json({"ok": True, "settings": save_settings({k: v for k, v in payload.items() if k in allowed})})
+            save_settings({k: v for k, v in payload.items() if k in allowed})
+            self.send_json({"ok": True, "settings": reader_settings()})
             return
         self.send_json({"ok": False, "error": "Not found"}, 404)
 
@@ -721,47 +1200,149 @@ class ReaderHandler(BaseHTTPRequestHandler):
 class ReaderServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 16
 
     def __init__(self, address: tuple[str, int], token: str):
         self.token = token
+        self.launch_token = token
+        self.token_lock = threading.Lock()
+        self.workers = threading.BoundedSemaphore(MAX_HTTP_WORKERS)
+        self.book_lock = threading.Lock()
+        self.books: dict[str, dict] = {}
         super().__init__(address, ReaderHandler)
+
+    def rotate_launch_session(self) -> None:
+        with self.token_lock:
+            if not self.launch_token:
+                return
+            self.token = secrets.token_urlsafe(24)
+            self.launch_token = ""
+            info = server_info()
+            if bounded_int(info.get("pid"), 0) == os.getpid():
+                info["token"] = self.token
+                info["sessionEstablished"] = utc_now()
+                atomic_json(SERVER_FILE, info)
+
+    def refresh_books(self) -> list[dict]:
+        books = scan_library()
+        with self.book_lock:
+            self.books = {book["id"]: book for book in books}
+        return books
+
+    def find_book(self, book_id: str) -> dict | None:
+        with self.book_lock:
+            book = self.books.get(book_id)
+        if book is not None:
+            return book
+        self.refresh_books()
+        with self.book_lock:
+            return self.books.get(book_id)
+
+    def process_request(self, request, client_address) -> None:
+        if not self.workers.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.workers.release()
 
 
 def serve(port: int = 0) -> int:
     token = secrets.token_urlsafe(24)
     server = ReaderServer(("127.0.0.1", port), token)
+    revision = runtime_revision()
     atomic_json(SERVER_FILE, {"pid": os.getpid(), "port": server.server_port, "token": token,
-                              "helper": str(Path(__file__).resolve()), "revision": runtime_revision(),
+                              "helper": str(Path(__file__).resolve()), "revision": revision,
                               "started": utc_now()})
+    stopping = threading.Event()
+
+    def request_stop(_signum, _frame) -> None:
+        stopping.set()
+
+    previous_term = signal.signal(signal.SIGTERM, request_stop)
+    server.timeout = 0.4
+    reader_seen = False
+    launch_deadline = time.monotonic() + 10.0
     try:
-        server.serve_forever(poll_interval=0.4)
+        while not stopping.is_set() and Path(__file__).is_file() and runtime_revision() == revision:
+            server.handle_request()
+            reader_info = read_json(READER_FILE, {})
+            if reader_process_alive(reader_info):
+                reader_seen = True
+            elif reader_seen or (isinstance(reader_info, dict) and bounded_int(reader_info.get("pid"), 0) > 0):
+                break
+            elif time.monotonic() >= launch_deadline:
+                break
     finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        server.server_close()
+        stop_owned_process(READER_FILE, b"ReaderApp.qml")
         if server_info().get("pid") == os.getpid():
             SERVER_FILE.unlink(missing_ok=True)
     return 0
 
 
+def stop_owned_process(path: Path, marker: bytes) -> bool:
+    info = read_json(path, {})
+    if not isinstance(info, dict):
+        return False
+    pid = bounded_int(info.get("pid"), 0)
+    if pid <= 0:
+        path.unlink(missing_ok=True)
+        return False
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if path == SERVER_FILE:
+            expected = os.fsencode(str(Path(__file__).resolve()))
+            owns_process = expected in command and b"serve" in command
+        else:
+            expected = os.fsencode(str((PLUGIN_DIR / "ReaderApp.qml").resolve()))
+            owns_process = expected in command and any(marker in part for part in command)
+        if not owns_process:
+            return False
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(40):
+            if not Path(f"/proc/{pid}").exists():
+                break
+            time.sleep(0.05)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def stop_runtime(reader_only: bool = False, server_only: bool = False, server_pid: int = 0) -> dict:
+    stopped_reader = False if server_only else stop_owned_process(READER_FILE, b"ReaderApp.qml")
+    server_matches = server_pid <= 0 or bounded_int(server_info().get("pid"), 0) == server_pid
+    stopped_server = False if reader_only or not server_matches else stop_owned_process(SERVER_FILE, b"ebook-tool")
+    return {"ok": True, "readerStopped": stopped_reader, "serverStopped": stopped_server}
+
+
 def start_server() -> dict:
     info = server_info()
     if server_alive(info):
-        return {"ok": True, "url": f"http://127.0.0.1:{info.get('port', PORT)}/", "pid": info.get("pid")}
+        return {"ok": True, "url": f"http://127.0.0.1:{info.get('port', PORT)}/",
+                "pid": info.get("pid"), "token": info.get("token")}
     if server_process_alive(info):
-        try:
-            os.kill(int(info["pid"]), 15)
-            for _ in range(30):
-                if not server_process_alive(info):
-                    break
-                time.sleep(0.05)
-        except (OSError, ValueError, TypeError):
-            pass
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+        stop_owned_process(SERVER_FILE, b"ebook-tool")
+    private_directory(STATE_DIR)
     subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "serve", "--port", "0"], stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     for _ in range(50):
         time.sleep(0.05)
         info = server_info()
         if server_alive(info):
-            return {"ok": True, "url": f"http://127.0.0.1:{info.get('port', PORT)}/", "pid": info.get("pid")}
+            return {"ok": True, "url": f"http://127.0.0.1:{info.get('port', PORT)}/",
+                    "pid": info.get("pid"), "token": info.get("token")}
     return {"ok": False, "error": "Reader service did not start"}
 
 
@@ -811,39 +1392,32 @@ def reader_environment() -> dict[str, str]:
 
 
 def launch_reader(book_id: str = "") -> dict:
-    payload = library_payload()
-    books = payload["books"]
-    wanted = book_id or str(payload.get("lastBookId", ""))
+    books = scan_library()
+    state = progress_state()
+    wanted = book_id or str(state.get("lastBookId", ""))
     if wanted and not any(book["id"] == wanted for book in books):
         return {"ok": False, "error": "Book not found"}
     if not wanted and books:
         wanted = books[0]["id"]
     if not wanted:
         return {"ok": False, "error": "No ebooks were found in the selected library folder"}
-    server = start_server()
-    if not server.get("ok"):
-        return server
     runner = shutil.which("qml6") or str(Path("/usr/lib/qt6/bin/qml"))
     if not Path(runner).is_file():
         runner = shutil.which("qml") or ""
     if not runner:
         return {"ok": False, "error": "The Qt 6 QML runner is not installed"}
+    stop_owned_process(SERVER_FILE, b"ebook-tool")
+    stop_owned_process(READER_FILE, b"ReaderApp.qml")
+    server = start_server()
+    if not server.get("ok"):
+        return server
+    token = bounded_text(server.get("token"), 128)
+    if not token:
+        return {"ok": False, "error": "Reader service did not establish a private session"}
     url = str(server["url"]) + "?book=" + urllib.parse.quote(wanted)
+    launch_url = url + "#token=" + urllib.parse.quote(token)
     update_progress(wanted, {})
-    previous = read_json(READER_FILE, {})
-    if isinstance(previous, dict):
-        previous_pid = int(previous.get("pid", 0) or 0)
-        try:
-            command_line = Path(f"/proc/{previous_pid}/cmdline").read_bytes().replace(b"\0", b" ")
-            if b"ReaderApp.qml" in command_line:
-                os.kill(previous_pid, 15)
-                for _ in range(20):
-                    time.sleep(0.05)
-                    if not Path(f"/proc/{previous_pid}").exists():
-                        break
-        except (OSError, ValueError):
-            pass
-    process = subprocess.Popen([runner, str(PLUGIN_DIR / "ReaderApp.qml"), "--", f"--leaf-reader-url={url}"],
+    process = subprocess.Popen([runner, str(PLUGIN_DIR / "ReaderApp.qml"), "--", f"--leaf-reader-url={launch_url}"],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True,
                                env=reader_environment())
@@ -859,9 +1433,14 @@ def parser() -> argparse.ArgumentParser:
     lib.add_argument("--refresh", action="store_true")
     lib.add_argument("--query", default="")
     lib.add_argument("--limit", type=int, default=0)
+    lib.add_argument("--deadline", type=float, default=MAX_SCAN_SECONDS)
     sub.add_parser("start")
     served = sub.add_parser("serve")
     served.add_argument("--port", type=int, default=0)
+    stopped = sub.add_parser("stop")
+    stopped.add_argument("--reader-only", action="store_true")
+    stopped.add_argument("--server-only", action="store_true")
+    stopped.add_argument("--server-pid", type=int, default=0)
     opened = sub.add_parser("open")
     opened.add_argument("book_id", nargs="?", default="")
     choose = sub.add_parser("choose-folder")
@@ -888,10 +1467,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return serve(args.port)
     if args.command == "library":
-        print(json.dumps(library_payload(args.refresh, args.query, args.limit), ensure_ascii=False))
+        print(json.dumps(library_payload(
+            args.refresh, args.query, args.limit, args.deadline, surface="shell",
+        ), ensure_ascii=False))
         return 0
     if args.command == "start":
         print(json.dumps(start_server()))
+        return 0
+    if args.command == "stop":
+        if args.reader_only and args.server_only:
+            print(json.dumps({"ok": False, "error": "Choose only one stop scope"}))
+            return 2
+        print(json.dumps(stop_runtime(
+            args.reader_only, args.server_only, max(0, args.server_pid),
+        )))
         return 0
     if args.command == "open":
         result = launch_reader(args.book_id)

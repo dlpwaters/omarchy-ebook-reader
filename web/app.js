@@ -298,7 +298,10 @@ async function openBook(bookId) {
     state.epub = ePub(await response.arrayBuffer());
     await state.epub.ready;
     const flow = state.settings.flow === "scrolled" ? "scrolled-doc" : "paginated";
-    state.rendition = state.epub.renderTo("viewer", { width: "100%", height: "100%", flow, spread: "auto", minSpreadWidth: 800 });
+    state.rendition = state.epub.renderTo("viewer", {
+      width: "100%", height: "100%", flow, spread: "auto", minSpreadWidth: 800,
+      allowScriptedContent: false, allowPopups: false,
+    });
     applyAppearance(false);
     state.rendition.on("relocated", onRelocated);
     state.rendition.on("rendered", (_, view) => {
@@ -461,8 +464,13 @@ async function initialize() {
   bindControls();
   chromeAwake();
   try {
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    state.token = fragment.get("token") || sessionStorage.getItem("leafReaderToken") || "";
+    if (state.token) sessionStorage.setItem("leafReaderToken", state.token);
+    if (location.hash) history.replaceState(null, "", `${location.pathname}${location.search}`);
     state.bootstrap = await api("/api/bootstrap");
-    state.token = state.bootstrap.token;
+    state.token = "";
+    sessionStorage.removeItem("leafReaderToken");
     state.settings = state.bootstrap.settings;
     applyAppearance(false);
     const requested = new URLSearchParams(location.search).get("book");

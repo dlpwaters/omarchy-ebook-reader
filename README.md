@@ -69,7 +69,7 @@ EPUB and PDF open directly. AZW3, MOBI, and the other conversion formats listed 
 omarchy plugin remove io.github.dlpwaters.ebook-reader
 ```
 
-Your books are never touched. Omarchy removes the plugin checkout; Leaf Reader's settings, progress, and cache remain in the XDG locations below so reinstalling can restore your place.
+Your books are never touched. Disabling or removing the widget closes its reader window and loopback service; the service also stops itself if the plugin checkout disappears. Omarchy removes the plugin checkout, while Leaf Reader's settings, progress, and cache remain in the XDG locations below so reinstalling can restore your place.
 
 ## Use
 
@@ -100,7 +100,7 @@ If a book folder contains EPUB plus another format, Leaf Reader always prefers t
 
 ## Privacy and storage
 
-Nothing is sent over the network. The helper binds only to a dynamically selected `127.0.0.1` port, uses a per-process request token for writes, and serves only known books and bundled reader assets. The reader uses an off-the-record WebEngine profile and disables outbound networking for book content. EPUB and sidecar covers are size/type/dimension checked, decoded outside the shell under explicit resource limits, and re-encoded as bounded PNG thumbnails before the panel loads them.
+Nothing is sent over the network. The helper binds only to a dynamically selected `127.0.0.1` port and requires a private per-process reader session for every library, book, cover, progress, and settings request. A one-time launch capability is invalidated and rotated as soon as authenticated bootstrap succeeds; the continuing session uses a strict same-site, HTTP-only cookie. Browser-facing responses contain no token, book path, or cache path. The reader uses an off-the-record WebEngine profile and disables outbound networking for book content. EPUB and sidecar covers are size/type/dimension checked, decoded outside the shell under explicit resource limits, and re-encoded as bounded PNG thumbnails before the panel loads them. Fixed state files, metadata fields, scan duration, record counts, HTTP bodies, server concurrency, and served book sizes all have explicit ceilings.
 
 - Settings: `$XDG_STATE_HOME/omarchy-ebook-reader/settings.json`
 - Reading progress and bookmarks: `$XDG_STATE_HOME/omarchy-ebook-reader/progress.json`
@@ -123,6 +123,8 @@ omarchy plugin validate .
 ## Troubleshooting
 
 Run `./ebook-tool doctor` inside the plugin folder. It reports the selected library, scanned book count, EPUB renderer, Qt WebEngine, and optional converter status.
+
+If a reader service ever remains after an abnormal shell or window crash, run `./ebook-tool stop` inside the installed plugin folder.
 
 If a folder was moved, choose it again in Reader settings. If covers or metadata changed, use the rescan button in the panel. A first open of a large AZW3/MOBI book may take a moment because the conversion is done locally and cached for later opens.
 

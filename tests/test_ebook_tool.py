@@ -1,4 +1,5 @@
 import base64
+import http.cookiejar
 import importlib.machinery
 import io
 import json
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -66,7 +68,7 @@ class LeafReaderTests(unittest.TestCase):
         folder = self.library / "A Reader" / "A Quiet Book"
         make_epub(folder / "A Quiet Book.epub")
         (folder / "A Quiet Book.azw3").write_bytes(b"kindle")
-        def fake_sanitizer(data, book_id, _mtime):
+        def fake_sanitizer(data, book_id, _mtime, _deadline=None):
             target = leaf.CACHE_DIR / "covers" / f"{book_id}.png"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
@@ -134,12 +136,42 @@ class LeafReaderTests(unittest.TestCase):
         info.flag_bits = 0
         info.file_size = 1
         archive = mock.Mock()
-        archive.getinfo.return_value = info
+        info.filename = "OPS/book.opf"
+        archive.infolist.return_value = [info]
         member = mock.MagicMock()
         member.__enter__.return_value.read.return_value = b"x" * 10
         archive.open.return_value = member
         self.assertIsNone(leaf.bounded_zip_member(archive, "OPS/book.opf", 8))
         member.__enter__.return_value.read.assert_called_once_with(9)
+
+    def test_duplicate_epub_metadata_members_are_rejected_as_ambiguous(self):
+        path = self.library / "Duplicate.epub"
+        make_epub(path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr("META-INF/container.xml", b"<container/>")
+        self.assertEqual(leaf.epub_metadata(path), {})
+        self.assertEqual(leaf.safe_cover_from_epub(path, "duplicate"), "")
+        with self.assertRaisesRegex(RuntimeError, "safe expansion limits"):
+            leaf.readable_file({"files": {"epub": str(path)}})
+
+    def test_epub_directory_count_is_bounded_before_zipfile_parsing(self):
+        path = self.library / "Many Members.epub"
+        make_epub(path)
+        with mock.patch.object(leaf, "MAX_EPUB_MEMBERS", 3), \
+             mock.patch.object(leaf.zipfile, "ZipFile") as parser:
+            self.assertFalse(leaf.epub_archive_is_safe(path))
+        parser.assert_not_called()
+
+    def test_epub_member_expansion_is_bounded_before_browser_use(self):
+        path = self.library / "Expanded.epub"
+        make_epub(path)
+        self.assertTrue(leaf.epub_archive_is_safe(path))
+        with mock.patch.object(leaf, "MAX_EPUB_MEMBER_BYTES", 8):
+            self.assertFalse(leaf.epub_archive_is_safe(path))
+            with self.assertRaisesRegex(RuntimeError, "safe expansion limits"):
+                leaf.readable_file({"files": {"epub": str(path)}})
 
     def test_cover_is_reencoded_by_resource_limited_process(self):
         def fake_run(command, **_kwargs):
@@ -155,6 +187,16 @@ class LeafReaderTests(unittest.TestCase):
         self.assertIn("512x768>", command)
         self.assertTrue(command[-1].startswith("png:"))
         self.assertEqual(run.call_args.kwargs["timeout"], 15)
+
+    def test_cover_decode_respects_the_scan_deadline(self):
+        def fake_run(command, **_kwargs):
+            Path(command[-1].removeprefix("png:")).write_bytes(VALID_PNG)
+            return mock.Mock(returncode=0)
+        deadline = leaf.time.monotonic() + 0.25
+        with mock.patch.object(leaf.shutil, "which", return_value="/usr/bin/magick"), \
+             mock.patch.object(leaf.subprocess, "run", side_effect=fake_run) as run:
+            self.assertTrue(leaf.sanitize_cover_bytes(VALID_PNG, "deadline-cover", deadline=deadline))
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 0.25)
 
     def test_sidecar_cover_is_never_served_directly_to_qml(self):
         folder = self.library / "Sidecar"
@@ -181,6 +223,21 @@ class LeafReaderTests(unittest.TestCase):
         book = leaf.scan_library()[0]
         self.assertEqual(book["title"], "Clouds Over Alder")
         self.assertEqual(book["author"], "River North")
+
+    def test_symlinked_books_and_sidecars_are_not_scanned(self):
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        make_epub(outside / "Outside.epub", title="Outside")
+        (self.library / "Linked.epub").symlink_to(outside / "Outside.epub")
+        folder = self.library / "Safe"
+        make_epub(folder / "Safe.epub", title="Safe")
+        (outside / "metadata.opf").write_text(
+            '<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Leaked</dc:title></metadata></package>',
+            encoding="utf-8",
+        )
+        (folder / "metadata.opf").symlink_to(outside / "metadata.opf")
+        books = leaf.scan_library(force=True)
+        self.assertEqual([book["title"] for book in books], ["Safe"])
 
     def test_markup_shaped_epub_metadata_remains_literal_data(self):
         folder = self.library / "Untrusted Metadata"
@@ -245,18 +302,43 @@ class LeafReaderTests(unittest.TestCase):
         make_epub(path, "Revised Title")
         self.assertEqual(leaf.scan_library()[0]["title"], "Revised Title")
 
-    def test_http_api_requires_token_for_writes_and_serves_epub(self):
+    def test_http_api_requires_session_for_all_library_routes(self):
         make_epub(self.library / "Book.epub")
         book = leaf.scan_library()[0]
         server = leaf.ReaderServer(("127.0.0.1", 0), "test-token")
         thread = leaf.threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base = f"http://127.0.0.1:{server.server_port}"
+        cookies = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookies))
         try:
-            with urllib.request.urlopen(base + "/api/bootstrap") as response:
+            for route in ("/api/bootstrap", "/api/book/" + book["id"]):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(base + route)
+                self.assertEqual(caught.exception.code, 403)
+                caught.exception.close()
+            bootstrap = urllib.request.Request(base + "/api/bootstrap")
+            bootstrap.add_header("X-Leaf-Token", "test-token")
+            with opener.open(bootstrap) as response:
                 payload = json.load(response)
-            self.assertEqual(payload["token"], "test-token")
-            with urllib.request.urlopen(base + "/api/book/" + book["id"]) as response:
+                cookie = response.headers.get("Set-Cookie", "")
+                csp = response.headers.get("Content-Security-Policy", "")
+            self.assertNotIn("token", payload)
+            self.assertNotIn("path", payload["books"][0])
+            self.assertNotIn("files", payload["books"][0])
+            self.assertNotIn("libraryFolder", payload["settings"])
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertIn("base-uri 'self'", csp)
+            self.assertIn("frame-ancestors 'none'", csp)
+            self.assertNotEqual(server.token, "test-token")
+            stale = urllib.request.Request(base + "/api/book/" + book["id"])
+            stale.add_header("X-Leaf-Token", "test-token")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(stale)
+            self.assertEqual(caught.exception.code, 403)
+            caught.exception.close()
+            with opener.open(base + "/api/book/" + book["id"]) as response:
                 self.assertEqual(response.headers.get_content_type(), "application/epub+zip")
                 self.assertTrue(response.read(4).startswith(b"PK"))
             request = urllib.request.Request(base + "/api/progress/" + book["id"], data=b"{}", method="POST")
@@ -286,7 +368,10 @@ class LeafReaderTests(unittest.TestCase):
         make_epub(self.library / "Book.epub")
         book = leaf.scan_library()[0]
         fake_process = mock.Mock(pid=4242)
-        with mock.patch.object(leaf, "start_server", return_value={"ok": True, "url": "http://127.0.0.1:4189/"}), \
+        with mock.patch.object(leaf, "start_server", return_value={
+                 "ok": True, "url": "http://127.0.0.1:4189/", "token": "private-token", "pid": 5151,
+             }), \
+             mock.patch.object(leaf, "stop_owned_process", return_value=False), \
              mock.patch.object(leaf.shutil, "which", side_effect=lambda name: sys.executable if name == "qml6" else None), \
              mock.patch.object(leaf, "activate_reader", return_value=True) as activate, \
              mock.patch.object(leaf.subprocess, "Popen", return_value=fake_process) as popen:
@@ -297,12 +382,94 @@ class LeafReaderTests(unittest.TestCase):
         self.assertEqual(command[0], sys.executable)
         self.assertEqual(Path(command[1]).name, "ReaderApp.qml")
         self.assertEqual(command[2], "--")
-        self.assertEqual(command[3], f"--leaf-reader-url=http://127.0.0.1:4189/?book={book['id']}")
+        self.assertEqual(
+            command[3],
+            f"--leaf-reader-url=http://127.0.0.1:4189/?book={book['id']}#token=private-token",
+        )
         webengine_flags = popen.call_args.kwargs["env"]["QTWEBENGINE_CHROMIUM_FLAGS"]
         self.assertIn("--proxy-server=http://127.0.0.1:9", webengine_flags)
         self.assertIn("--disable-background-networking", webengine_flags)
+        self.assertNotIn("LEAF_READER_TOKEN", popen.call_args.kwargs["env"])
+        self.assertEqual(result["url"], f"http://127.0.0.1:4189/?book={book['id']}")
+        self.assertNotIn("token", leaf.read_json(leaf.READER_FILE, {})["url"])
         activate.assert_called_once_with(4242)
         self.assertEqual(leaf.progress_state()["lastBookId"], book["id"])
+
+    def test_writable_json_and_metadata_fields_are_bounded(self):
+        leaf.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        leaf.SETTINGS_FILE.write_bytes(b" " * (leaf.MAX_SETTINGS_BYTES + 1))
+        self.assertEqual(leaf.read_json(leaf.SETTINGS_FILE, {"safe": True}), {"safe": True})
+        leaf.atomic_json(leaf.SETTINGS_FILE, {"libraryFolder": str(self.library)})
+        huge_title = "T" * (leaf.MAX_TITLE_CHARS + 50)
+        huge_author = "A" * (leaf.MAX_AUTHOR_CHARS + 50)
+        make_epub(self.library / "Bounded.epub", title=huge_title, author=huge_author)
+        book = leaf.scan_library(force=True)[0]
+        self.assertEqual(len(book["title"]), leaf.MAX_TITLE_CHARS)
+        self.assertEqual(len(book["authors"][0]), leaf.MAX_AUTHOR_CHARS)
+
+    def test_deeply_nested_writable_json_cannot_replace_settings(self):
+        leaf.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        leaf.SETTINGS_FILE.write_text("[" * 1500 + "0" + "]" * 1500, encoding="utf-8")
+        loaded = leaf.settings()
+        self.assertIsInstance(loaded, dict)
+        self.assertEqual(loaded["libraryFolder"], leaf.default_settings()["libraryFolder"])
+
+    def test_shell_payload_has_an_explicit_byte_ceiling(self):
+        for index in range(12):
+            make_epub(
+                self.library / f"Book {index}.epub",
+                title=f"{index}-" + "T" * leaf.MAX_TITLE_CHARS,
+                author="A" * leaf.MAX_AUTHOR_CHARS,
+            )
+        with mock.patch.object(leaf, "sanitize_cover_bytes", return_value=""), \
+             mock.patch.object(leaf, "MAX_SHELL_PAYLOAD_BYTES", 1800):
+            payload = leaf.library_payload(surface="shell")
+            encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.assertLessEqual(len(encoded), 1800)
+        self.assertTrue(payload["truncated"])
+        self.assertLess(payload["count"], 12)
+
+    def test_shell_and_reader_payloads_expose_only_bounded_surfaces(self):
+        make_epub(self.library / "Book.epub")
+        shell = leaf.library_payload(surface="shell")
+        reader = leaf.library_payload(surface="reader")
+        self.assertIn("libraryFolder", shell["settings"])
+        self.assertIsInstance(shell["books"][0]["cover"], str)
+        self.assertNotIn("libraryFolder", reader["settings"])
+        self.assertNotIn("starterLibrary", reader)
+        self.assertNotIn("path", reader["books"][0])
+        self.assertNotIn("files", reader["books"][0])
+        self.assertIsInstance(reader["books"][0]["cover"], bool)
+
+    def test_progress_fields_and_bookmarks_are_bounded(self):
+        make_epub(self.library / "Book.epub")
+        book = leaf.scan_library()[0]
+        bookmarks = [{"cfi": "c" * (leaf.MAX_CFI_CHARS + 20), "label": "l" * 2000}] * (leaf.MAX_BOOKMARKS + 10)
+        saved = leaf.update_progress(book["id"], {
+            "cfi": "x" * (leaf.MAX_CFI_CHARS + 10),
+            "chapter": "y" * (leaf.MAX_CHAPTER_CHARS + 10),
+            "bookmarks": bookmarks,
+        })
+        self.assertEqual(len(saved["cfi"]), leaf.MAX_CFI_CHARS)
+        self.assertEqual(len(saved["chapter"]), leaf.MAX_CHAPTER_CHARS)
+        self.assertEqual(len(saved["bookmarks"]), leaf.MAX_BOOKMARKS)
+
+    def test_lifecycle_hooks_stop_only_the_matching_reader_session(self):
+        leaf.atomic_json(leaf.SERVER_FILE, {"pid": 999999, "token": "current"})
+        with mock.patch.object(leaf, "stop_owned_process", return_value=True) as stop:
+            mismatch = leaf.stop_runtime(server_only=True, server_pid=111111)
+            match = leaf.stop_runtime(server_only=True, server_pid=999999)
+        self.assertFalse(mismatch["serverStopped"])
+        self.assertTrue(match["serverStopped"])
+        stop.assert_called_once_with(leaf.SERVER_FILE, b"ebook-tool")
+        bar = (ROOT / "BarWidget.qml").read_text(encoding="utf-8")
+        reader = (ROOT / "ReaderApp.qml").read_text(encoding="utf-8")
+        helper = (ROOT / "ebook-tool").read_text(encoding="utf-8")
+        self.assertIn('Quickshell.execDetached([root.helperPath, "stop"])', bar)
+        self.assertNotIn("import Quickshell", reader)
+        self.assertIn("reader_process_alive(reader_info)", helper)
+        self.assertIn("server.rotate_launch_session()", helper)
+        self.assertIn('stop_owned_process(READER_FILE, b"ReaderApp.qml")', helper)
 
     def test_untrusted_qml_metadata_is_rendered_as_plain_text(self):
         panel = (ROOT / "Panel.qml").read_text(encoding="utf-8")
@@ -345,6 +512,9 @@ class LeafReaderTests(unittest.TestCase):
         self.assertEqual(panel.count("sourceSize: Qt.size("), 2)
         self.assertIn("sourceSize: Qt.size(Style.space(140), Style.space(212))", panel)
         self.assertIn("sourceSize: Qt.size(Style.space(212), Style.space(290))", panel)
+        app = (ROOT / "web/app.js").read_text(encoding="utf-8")
+        self.assertIn("allowScriptedContent: false", app)
+        self.assertIn("allowPopups: false", app)
 
 
 if __name__ == "__main__":

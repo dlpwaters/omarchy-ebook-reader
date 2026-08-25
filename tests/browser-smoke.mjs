@@ -76,6 +76,8 @@ try {
     const frame = document.querySelector('#viewer iframe');
     return {
       title: document.querySelector('#bookTitle')?.textContent,
+      activeTitle: state.book?.title,
+      libraryCount: state.bootstrap?.books?.length || 0,
       theme: state.settings.theme,
       flow: state.settings.flow,
       pageTurn: state.settings.pageTurn,
@@ -86,7 +88,8 @@ try {
       text: frame?.contentDocument?.body?.innerText?.trim() || ''
     };
   })()`);
-  assert(initial.title === "Pride and Prejudice", `Unexpected title: ${initial.title}`);
+  assert(initial.title && initial.title === initial.activeTitle, `Unexpected title: ${initial.title}`);
+  assert(initial.libraryCount >= 4, `Starter library did not load: ${initial.libraryCount} books`);
   assert(initial.theme === "paper" && initial.flow === "paginated" && initial.pageTurn === true, "Unexpected initial reader settings");
   assert(initial.width === "760px", `Reading width was not applied to the viewport: ${initial.width}`);
   assert(initial.viewerWidth > 1100, `Reader did not open as a two-page spread: ${initial.viewerWidth}px`);

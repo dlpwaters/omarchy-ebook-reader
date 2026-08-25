@@ -58,7 +58,9 @@ Panel {
     if (libraryProc.running || helperPath === "") return
     loading = true
     libraryOutput = ""
-    libraryProc.command = force ? [helperPath, "library", "--refresh"] : [helperPath, "library"]
+    libraryProc.command = force
+      ? [helperPath, "library", "--refresh", "--limit", "1000", "--deadline", "8"]
+      : [helperPath, "library", "--limit", "1000", "--deadline", "8"]
     libraryProc.running = true
   }
 
@@ -75,6 +77,8 @@ Panel {
     lastBookId = String(payload.lastBookId || "")
     converterAvailable = payload.converterAvailable === true
     rebuildVisibleBooks()
+    if (payload.truncated === true)
+      showStatus("Showing the first 1,000 books. Narrow the selected library folder for a smaller shelf.", false)
     var recent = lastBook()
     if (hostWidget && recent && typeof hostWidget.setLastTitle === "function")
       hostWidget.setLastTitle(recent.title)

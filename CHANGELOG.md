@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.5 — 2026-08-24
+
+- Require the private reader session for every library, book, cover, progress, and settings API route; bootstrap no longer returns the token or filesystem paths
+- Rotate the one-time launch capability immediately after authenticated bootstrap, establish a strict same-site cookie for the private reader session, and stream bounded book files instead of buffering them in server memory
+- Stop the reader service when its window closes, the widget unloads, or the plugin checkout changes or disappears; add an explicit `ebook-tool stop` recovery command
+- Bound writable JSON files, metadata fields, progress/bookmark values, library records, shell output, scan duration, HTTP bodies, worker concurrency, EPUB central-directory/member/expanded sizes, and converter diagnostics
+- Validate direct and converted EPUB archives before browser use, serialize conversions, and use unpredictable private conversion staging files
+- Reject symlinked library files and sidecars so cached or writable local state cannot redirect the reader outside the selected library and private cache
+
 ## 1.1.4 — 2026-08-23
 
 - Reject oversized EPUB container and package XML from ZIP descriptors before decompression or parsing
