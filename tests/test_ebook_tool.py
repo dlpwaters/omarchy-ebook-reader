@@ -331,6 +331,7 @@ class LeafReaderTests(unittest.TestCase):
             self.assertIn("SameSite=Strict", cookie)
             self.assertIn("base-uri 'self'", csp)
             self.assertIn("frame-ancestors 'none'", csp)
+            self.assertIn("frame-src blob: data: 'self'", csp)
             self.assertNotEqual(server.token, "test-token")
             stale = urllib.request.Request(base + "/api/book/" + book["id"])
             stale.add_header("X-Leaf-Token", "test-token")
@@ -393,6 +394,32 @@ class LeafReaderTests(unittest.TestCase):
         self.assertEqual(result["url"], f"http://127.0.0.1:4189/?book={book['id']}")
         self.assertNotIn("token", leaf.read_json(leaf.READER_FILE, {})["url"])
         activate.assert_called_once_with(4242)
+        self.assertEqual(leaf.progress_state()["lastBookId"], book["id"])
+
+    def test_pdf_launch_uses_xournalpp_without_starting_reader_server(self):
+        path = self.library / "Notes.pdf"
+        path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        book = leaf.scan_library()[0]
+        fake_process = mock.Mock(pid=4242)
+        with mock.patch.object(
+                 leaf.shutil, "which",
+                 side_effect=lambda name: "/usr/bin/xournalpp" if name == "xournalpp" else None,
+             ), \
+             mock.patch.object(leaf, "start_server") as start_server, \
+             mock.patch.object(leaf, "stop_owned_process", return_value=False) as stop, \
+             mock.patch.object(leaf, "activate_reader", return_value=True) as activate, \
+             mock.patch.object(leaf.subprocess, "Popen", return_value=fake_process) as popen:
+            result = leaf.launch_reader(book["id"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["viewer"], "xournalpp")
+        self.assertEqual(popen.call_args.args[0], ["/usr/bin/xournalpp", str(path)])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(stop.call_args_list, [
+            mock.call(leaf.SERVER_FILE, b"ebook-tool"),
+            mock.call(leaf.READER_FILE, b"ReaderApp.qml"),
+        ])
+        start_server.assert_not_called()
+        activate.assert_called_once_with(4242, "com.github.xournalpp.xournalpp")
         self.assertEqual(leaf.progress_state()["lastBookId"], book["id"])
 
     def test_writable_json_and_metadata_fields_are_bounded(self):
@@ -515,6 +542,9 @@ class LeafReaderTests(unittest.TestCase):
         app = (ROOT / "web/app.js").read_text(encoding="utf-8")
         self.assertIn("allowScriptedContent: false", app)
         self.assertIn("allowPopups: false", app)
+        reader = (ROOT / "ReaderApp.qml").read_text(encoding="utf-8")
+        self.assertIn("settings.pluginsEnabled: true", reader)
+        self.assertIn("settings.pdfViewerEnabled: true", reader)
 
 
 if __name__ == "__main__":

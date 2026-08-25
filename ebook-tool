@@ -1039,7 +1039,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self' blob:; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src blob: 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self' blob:; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src blob: data: 'self'")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -1346,7 +1346,7 @@ def start_server() -> dict:
     return {"ok": False, "error": "Reader service did not start"}
 
 
-def activate_reader(pid: int) -> bool:
+def activate_reader(pid: int, fallback_class: str = "") -> bool:
     """Focus and fullscreen the reader on Hyprland, with Qt as the fallback elsewhere."""
     hyprctl = shutil.which("hyprctl")
     if not hyprctl or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
@@ -1356,7 +1356,17 @@ def activate_reader(pid: int) -> bool:
         try:
             listed = subprocess.run([hyprctl, "clients", "-j"], capture_output=True, text=True, timeout=1)
             clients = json.loads(listed.stdout) if listed.returncode == 0 else []
-            if any(int(client.get("pid", 0)) == pid for client in clients):
+            client = next(
+                (candidate for candidate in clients if int(candidate.get("pid", 0)) == pid),
+                None,
+            )
+            if client is None and fallback_class:
+                client = next(
+                    (candidate for candidate in clients if candidate.get("class") == fallback_class),
+                    None,
+                )
+            if client:
+                selector = f"pid:{int(client.get('pid', pid))}"
                 # Let Qt finish its initial visibility negotiation before the
                 # compositor applies the final state. Otherwise a late Qt
                 # surface update can restore the window to the tiled layout.
@@ -1395,12 +1405,29 @@ def launch_reader(book_id: str = "") -> dict:
     books = scan_library()
     state = progress_state()
     wanted = book_id or str(state.get("lastBookId", ""))
-    if wanted and not any(book["id"] == wanted for book in books):
+    book = next((candidate for candidate in books if candidate["id"] == wanted), None)
+    if wanted and book is None:
         return {"ok": False, "error": "Book not found"}
     if not wanted and books:
-        wanted = books[0]["id"]
+        book = books[0]
+        wanted = book["id"]
     if not wanted:
         return {"ok": False, "error": "No ebooks were found in the selected library folder"}
+    xournalpp = shutil.which("xournalpp")
+    if book.get("files", {}).get("pdf") and not book.get("files", {}).get("epub") and xournalpp:
+        try:
+            pdf = readable_file(book)
+        except (OSError, RuntimeError) as exc:
+            return {"ok": False, "error": bounded_text(str(exc), 1024, "PDF could not be opened")}
+        stop_owned_process(SERVER_FILE, b"ebook-tool")
+        stop_owned_process(READER_FILE, b"ReaderApp.qml")
+        update_progress(wanted, {})
+        process = subprocess.Popen(
+            [xournalpp, str(pdf)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        activate_reader(process.pid, "com.github.xournalpp.xournalpp")
+        return {"ok": True, "pid": process.pid, "bookId": wanted, "viewer": "xournalpp"}
     runner = shutil.which("qml6") or str(Path("/usr/lib/qt6/bin/qml"))
     if not Path(runner).is_file():
         runner = shutil.which("qml") or ""
@@ -1538,6 +1565,7 @@ def main(argv: list[str] | None = None) -> int:
             "starterBooks": len([path for path in STARTER_LIBRARY_DIR.glob("*.epub") if path.is_file()]),
             "books": len(scan_library()),
             "epubRenderer": (WEB_DIR / "vendor/epub.min.js").is_file(),
+            "pdfViewer": shutil.which("xournalpp") or "Qt WebEngine",
             "converter": shutil.which("ebook-convert") or "",
             "qtWebEngine": Path("/usr/lib/qt6/qml/QtWebEngine").is_dir(),
         }
