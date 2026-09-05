@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Open PDF-only books in the Omarchy-provided Xournal++ application, retaining the Qt WebEngine viewer as a fallback
+
 ## 1.1.5 — 2026-08-24
 
 - Require the private reader session for every library, book, cover, progress, and settings API route; bootstrap no longer returns the token or filesystem paths

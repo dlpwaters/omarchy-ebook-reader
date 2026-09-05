@@ -126,6 +126,7 @@ QQC.ApplicationWindow {
     settings.localContentCanAccessFileUrls: false
     settings.javascriptCanOpenWindows: false
     settings.fullScreenSupportEnabled: false
+    settings.pluginsEnabled: true
     settings.pdfViewerEnabled: true
 
     Component.onCompleted: forceActiveFocus()

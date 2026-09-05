@@ -28,7 +28,7 @@ Choose Paper, Sepia, Slate, or Night dark mode, then fine-tune the text size, se
 - Recursively scans any folder you choose
 - Groups multiple formats of the same book into one library entry
 - Reads EPUB directly, with covers and metadata extracted locally
-- Reads PDF through Qt WebEngine's built-in viewer
+- Opens PDF in Xournal++ for reading and annotation, with Qt WebEngine as a fallback
 - Supports AZW3, MOBI, AZW, PRC, FB2, FBZ, HTMLZ, RTF, TXT, and TXTZ when the optional `ebook-convert` command is available
 - Includes title/author search, table of contents, in-book search, bookmarks, progress scrubbing, and keyboard navigation
 - Provides text size, serif/sans/publisher fonts, line spacing, per-page width, page/scroll layouts, and Paper, Sepia, Slate, and Night themes
@@ -42,7 +42,7 @@ Choose Paper, Sepia, Slate, or Night dark mode, then fine-tune the text size, se
 omarchy plugin add https://github.com/dlpwaters/omarchy-ebook-reader.git --enable
 ```
 
-Leaf Reader needs `qt6-declarative`, `qt6-webengine`, `python`, `imagemagick`, `zenity`, and `noto-fonts`. EPUB and PDF work without Calibre. ImageMagick is used only in a short-lived, resource-limited process that turns accepted JPEG/PNG cover art into small safe thumbnails; if it is unavailable, Leaf Reader shows text cover placeholders instead of passing raw book images to the Omarchy shell.
+Leaf Reader needs `qt6-declarative`, `qt6-webengine`, `python`, `imagemagick`, `zenity`, and `noto-fonts`. PDF books open in Xournal++ when its `xournalpp` command is available, as it is on a standard Omarchy installation; Qt WebEngine remains the fallback. EPUB and PDF work without Calibre. ImageMagick is used only in a short-lived, resource-limited process that turns accepted JPEG/PNG cover art into small safe thumbnails; if it is unavailable, Leaf Reader shows text cover placeholders instead of passing raw book images to the Omarchy shell.
 
 On first use, Leaf Reader opens its bundled starter shelf unless `~/Books` already contains ebooks.
 
@@ -92,7 +92,7 @@ Reader controls fade away while you read and return on pointer movement, a click
 | Format | How it opens |
 | --- | --- |
 | EPUB | Directly in the bundled offline EPUB engine |
-| PDF | Directly in Qt WebEngine |
+| PDF | Directly in Xournal++, with Qt WebEngine fallback |
 | AZW3, MOBI, AZW, PRC | Converted locally to a cached EPUB on first open |
 | FB2, FBZ, HTMLZ, RTF, TXT, TXTZ | Converted locally to a cached EPUB on first open |
 
