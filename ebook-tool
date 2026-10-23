@@ -1136,11 +1136,11 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 self.send_bytes(b"", "image/png", 404)
                 return
             book = self.server.find_book(book_id)
-            cover = Path(book["cover"]) if book and book.get("cover") else None
-            if not cover or not cached_cover_path(cover, book_id):
+            cover = cached_cover_path(book["cover"], book_id) if book and book.get("cover") else ""
+            if not cover:
                 self.send_bytes(b"", "image/png", 404)
                 return
-            self.send_bytes(cover.read_bytes(), "image/png", cache="private, max-age=86400")
+            self.send_bytes(Path(cover).read_bytes(), "image/png", cache="private, max-age=86400")
             return
         relative = "index.html" if route in {"/", "/reader"} else route.lstrip("/")
         target = (WEB_DIR / relative).resolve()

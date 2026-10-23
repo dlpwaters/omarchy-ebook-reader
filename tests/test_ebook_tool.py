@@ -352,6 +352,32 @@ class LeafReaderTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_http_cover_route_serves_cached_cover(self):
+        make_epub(self.library / "Book.epub")
+        def fake_sanitizer(data, book_id, _mtime, _deadline=None):
+            target = leaf.CACHE_DIR / "covers" / f"{book_id}.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            return str(target)
+        with mock.patch.object(leaf, "sanitize_cover_bytes", side_effect=fake_sanitizer):
+            book = leaf.scan_library()[0]
+        server = leaf.ReaderServer(("127.0.0.1", 0), "test-token")
+        thread = leaf.threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        try:
+            bootstrap = urllib.request.Request(base + "/api/bootstrap")
+            bootstrap.add_header("X-Leaf-Token", "test-token")
+            with opener.open(bootstrap) as response:
+                self.assertIs(json.load(response)["books"][0]["cover"], True)
+            with opener.open(base + "/api/cover/" + book["id"]) as response:
+                self.assertEqual(response.headers.get_content_type(), "image/png")
+                self.assertEqual(response.read(), VALID_PNG)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_paths_outside_web_root_are_not_served(self):
         server = leaf.ReaderServer(("127.0.0.1", 0), "test-token")
         thread = leaf.threading.Thread(target=server.serve_forever, daemon=True)

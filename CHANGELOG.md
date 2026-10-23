@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Open PDF-only books in the Omarchy-provided Xournal++ application, retaining the Qt WebEngine viewer as a fallback
+- Fix library covers rendering as broken images in the reader window; the cover route validated a `Path` that `bounded_text` rejects, so every cover returned 404
 
 ## 1.1.5 — 2026-08-24
 
